@@ -1,0 +1,303 @@
+---
+title: "Programowanie w R: Projekt"
+author: "Zuzanna Juszczak 141238"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    keep_md: yes
+    theme: cerulean
+bibliography: references.bib
+---
+
+```{r global_settings, echo=FALSE}
+set.seed(23)
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+## Podsumowanie analizy
+Raport ten został wykonany w celu przeanalizowania i znalezienia głównych przyczyn stopniowego karłowacenia śledzi oceanicznych wyławianych w Europie. 
+
+Najpierw uzupełniono otrzymane dane, dodano rok połowu oraz uzupełniono brakujące wartości. Przedstawiono podstawowe statystyki, analizę rozkładu wartości atrybutów oraz korelację pomiędzy zmiennymi. Zmienne najbardziej skorelowane z długością śledzia to temperatura przy powierzchni wody, oscylacja północnoatlantycka (są one skorelowane negatywnie), poza tym również natężenie połowów w regionie, dostępność określonego rodzaju planktonu *lcop1* (te zmienne są skorelowane dodatnio z długością śledzia). Utworzono 3 regresory z różnymi trzema algorytmami: linear regression, random forest oraz multi-layer perceptron, a następnie wybrano najlepszy z nich. 
+
+Przeprowadzenie szczegółowej analizy pozwoliło na wyznaczenie przyczyn zmniejszania się długości śledzi. Główną przyczyną może być globalne ocieplenie i jedno z jego skutków, czyli podwyższanie się temperatur wód. Kolejną przyczyną jest niestety działalność człowieka i wzmożone łowy danego gatunku ryb. Również mniejsza ilość dostępnego planktonu wpływa na karłowacenie śledzi, skutkiem mniejszej ilości tego pokarmu może być również globalne ocieplenie, a co za tym idzie, mniej sprzyjające warunki do rozwoju.
+
+## Wykorzystane biblioteki
+
+```{r used_libraries}
+library(tidyr)
+library(dplyr)
+library(zoo)
+library(ggplot2) 
+library(ggcorrplot)
+library(gganimate)
+library(plotly)
+library(caret)
+```
+
+## Wczytanie danych
+
+```{r data_load}
+fishes <- read.csv("sledzie.csv")
+knitr::kable(head(fishes))
+```
+
+### Poprawne wczytanie brakujących danych
+
+Powyżej widzimy, że zbiór zawiera brakujące dane (znaki **?**). Wczytamy więc dane jeszcze raz, ale tym razem z poprawnie określonym parametrem określającym wartości brakujące. Usuniemy również pierwszą kolumnę, ponieważ nie wnosi ona żadnych informacji (jest to liczba porządkowa).
+
+```{r missing_data_load}
+fishes <- read.csv("sledzie.csv", na.strings = "?")
+fishes <- fishes[-1]
+knitr::kable(head(fishes))
+```
+
+## Przetworzenie brakujących danych
+
+### Brakujące dane o roku
+
+Według opisu zbioru danych, dane te pochodzą z pomiarów na przestrzeni 60 lat. Problemem jest jednak fakt, że same dane zawierają jedynie kolumnę określającą miesiąc, a brakuje kolumny określającej rok połowu. 
+
+Poniżej przedstawione są założenia potrzebne do wyznaczenia roku:
+
+  * kolumna *recr* przedstawia roczny narybek - ponieważ jest to wartość roczna, oznacza to, że wszystkie rekordy z tego samego roku mają tę wartość taką samą i to właśnie na tej podstawie wyznaczymy rok,
+  * unikalnych wartości *recr* jest `r n_distinct(fishes$recr)`, czyli z tylu lat będziemy mieli dostępne pomiary,
+  * problemem jest brak wiedzy odnośnie chronologii danych - zakładamy więc, że pomiary są w kolejności chronologicznej,
+  * drugim problemem jest przeplatanie się danych o tych samych wartościach rocznego narybku z danymi o innych wartościach, tutaj jednak znowu jako założenie przyjmujemy chronologię danych.
+  
+Podsumowując powyższe informacje, rok zostanie wyznaczony na podstawie kolumny *recr* (roczny narybek), każda unikalna wartość tej kolumny to kolejny rok pomiarów, chronologię wyznacza kolejność występowania danych.
+
+```{r missing_years}
+years <- unique(fishes$recr)
+fishes <- mutate(fishes, year = match(recr, years))
+```
+
+### Analiza brakujących wartości
+
+```{r missing_data_count}
+how_many_na = sum(is.na(fishes))
+knitr::kable(summary(fishes))
+```
+
+Problemem jest ilość brakujących danych - w zbiorze znajduje się łącznie aż **`r how_many_na`** brakujących wartości i znajdują się one w kolumnach: *cfin1*, *cfin2*, *chel1*, *chel2*, *lcop1*, *lcop2*, *sst*.
+
+### Uzupełnienie brakujących wartości
+
+Wyżej wspomniane brakujące wartości uzupełnimy - zastąpimy je wartością średnią pogrupowaną po roku i miesiącu połowu. Pozwoli to nam na w miarę realistyczne odwzorowanie brakujących danych, ponieważ wartości te w przeciągu miesiąca niewiele się zmieniają. 
+
+```{r missing_data_calculation} 
+fishes <- fishes %>% 
+  group_by(year, xmonth) %>% 
+  mutate_at(vars(cfin1, cfin2, chel1, chel2, lcop1, lcop2, sst), ~replace_na(., mean(., na.rm = TRUE)))
+
+knitr::kable(summary(fishes))
+```
+
+Jak możemy zauważyć, teraz nasz zbiór nie posiada już brakujących danych i jesteśmy gotowi do dalszej analizy.
+
+## Opis kolumn oraz podstawowe statystyki
+
+```{r dimensions}
+fishes_dim = dim(fishes)
+```
+
+Zbiór zawiera **`r fishes_dim[1]`** wierszy oraz **`r fishes_dim[2]`** kolumn. Kolumny te to:
+
+  * *length*: długość złowionego śledzia [cm],
+  * *cfin1*: dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 1],
+  * *cfin2*: dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 2],
+  * *chel1*: dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 1],
+  * *chel2*: dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 2],
+  * *lcop1*: dostępność planktonu [zagęszczenie widłonogów gat. 1],
+  * *lcop2*: dostępność planktonu [zagęszczenie widłonogów gat. 2],
+  * *fbar*: natężenie połowów w regionie [ułamek pozostawionego narybku],
+  * *recr*: roczny narybek [liczba śledzi],
+  * *cumf*: łączne roczne natężenie połowów w regionie [ułamek pozostawionego narybku],
+  * *totaln*: łączna liczba ryb złowionych w ramach połowu [liczba śledzi],
+  * *sst*: temperatura przy powierzchni wody [°C],
+  * *sal*: poziom zasolenia wody [Knudsen ppt],
+  * *xmonth*: miesiąc połowu [numer miesiąca],
+  * *nao*: oscylacja północnoatlantycka [mb],
+  * *year*: rok połowu [liczba porządkowa roku] **(dodatkowa kolumna dodana w trakcie przetwarzania danych)**. 
+
+```{r summary}
+knitr::kable(summary(fishes))
+```
+
+## Analiza wartości atrybutów
+
+```{r attribute_analysis, fig.height=8}
+ggplot(gather(fishes), aes(x=value)) + 
+  geom_histogram(color="black", fill="blue") + 
+  facet_wrap(~ key, scales = 'free_x') +
+  theme_bw() +
+  ggtitle("Rozkład wartości atrybutów")
+```
+
+## Korelacje między zmiennymi
+
+```{r correlation_drop_columns}
+drop <- c("year", "xmonth")
+corr_matrix = round(cor(fishes[,!names(fishes) %in% drop]), 2)
+```
+
+Przy obliczaniu korelacji pominiemy rok oraz miesiąc połowu, ponieważ tych dwóch kolumn nie chcemy uwzględniać przy wybieraniu atrybutów do utworzenia regresora.
+
+```{r correlation}
+ggcorrplot(corr_matrix, 
+           type = "lower", 
+           lab = TRUE,
+           title = "Korelacja zmiennych",
+           ggtheme=theme_bw)
+```
+
+Z powyższego wykresu możemy odczytać, które zmienne są skorelowane ze zmienną *length*. Widzimy, że *length* jest najsilniej skorelowane z: 
+
+  * *sst* (-0.45) oraz *nao* (-0.26) (korelacja ujemna), 
+  * *fbar* (0.25), *lcop1* (0.24), *chel1* (0.22) (korelacja dodatnia).
+
+Te zmienne weźmiemy pod uwagę przy tworzeniu regresora.
+
+## Zmiana rozmiaru śledzi w czasie
+
+```{r animation}
+plot_fishes <- fishes %>% mutate(date = as.Date(as.yearmon(paste(xmonth, " ", year), "%m %Y"))) %>% group_by(date) %>% summarize(length_mean = mean(length))
+
+animation_plot <- ggplot(plot_fishes, aes(x=date, y=length_mean)) + geom_line() +
+  labs(x = "Data połowu", y = "Średnia długość śledzia") +
+  ggtitle("Zmiana długości śledzia w czasie") +
+  theme_bw()
+
+animation_plot + transition_reveal(date)
+```
+
+```{r smooth}
+ggplot(plot_fishes, aes(x=date, y=length_mean)) + geom_smooth() +
+  labs(x = "Data połowu", y = "Średnia długość śledzia") +
+  ggtitle("Linia trendu zmiany długości śledzia w czasie") +
+  theme_bw()
+```
+
+Na powyższym wykresie można zauważyć linię trendu w odniesieniu do długości śledzia. Zauważamy od pewnego momentu zjawisko karłowacenia śledzi (widzimy tendencję spadkową długości).
+
+## Regresor przewidujący rozmiar śledzia
+
+Utworzymy 3 regresory wykorzystując algorytmy: 
+
+  * **linear regression**,
+  * **random forest**,
+  * **multi-layer perceptron**.
+  
+Atrybutami użytymi przy regresorze będa atrybuty wyznaczone w punkcie dotyczącym korelacji, tj. *sst*, *nao*, *fbar*, *lcop1* oraz *chel1*. Przy  tworzeniu każdego regresora będziemy optymalizować ich parametry, aby uzyskać jak najlepsze wyniki.
+
+### Przygotowanie zbiorów
+
+```{r regression_setup}
+in_training <- createDataPartition(y = fishes$length, p=0.75, list=FALSE)
+training <- fishes[in_training,]
+testing  <- fishes[-in_training,]
+
+ctrl <- trainControl(
+    method = "repeatedcv",
+    number = 2,
+    repeats = 5)
+```
+
+### Linear Regression
+#### Zbiór treningowy
+
+```{r linear_regression_training}
+lm_model <- train(length ~ sst + nao + fbar + lcop1 + chel1,
+             data = training,
+             method = "lm",
+             preProcess = c("center", "scale"),
+             trControl = ctrl,
+             tuneGrid = expand.grid(intercept = c(TRUE, FALSE)))
+
+lm_model
+ggplot(lm_model) + geom_line() + geom_point() + ggtitle("Optymalizacja parametru intercept") + theme_bw()
+```
+
+#### Zbiór testowy
+
+```{r linear_regression_testing}
+lm_predicted <- predict(lm_model, testing)
+postResample(pred = lm_predicted, obs = testing$length)
+```
+
+### Random forest
+#### Zbiór treningowy
+
+```{r random_forest_training}
+rf_model <- train(length ~ sst + nao + fbar + lcop1 + chel1,
+             data = training,
+             method = "rf",
+             preProcess = c("center", "scale"),
+             trControl = ctrl,
+             tuneGrid = expand.grid(mtry = seq(10, 31, by = 2)),
+             ntree = 30)
+
+rf_model
+ggplot(rf_model) + geom_line() + geom_point() + ggtitle("Optymalizacja parametru mtry") + theme_bw()
+```
+
+#### Zbiór testowy
+
+```{r random_forest_testing}
+rf_predicted <- predict(rf_model, testing)
+postResample(pred = rf_predicted, obs = testing$length)
+```
+
+### Multi-Layer Perceptron
+#### Zbiór treningowy
+
+```{r mlp_training}
+mlp_model <- train(length ~ sst + nao + fbar + lcop1 + chel1,
+             data = training,
+             method = "mlp",
+             preProcess = c("center", "scale"),
+             trControl=ctrl,
+             tuneGrid = expand.grid(size = seq(1, 11, by = 2)))
+
+mlp_model
+ggplot(mlp_model) + geom_line() + geom_point() + ggtitle("Optymalizacja parametru size") + theme_bw()
+```
+
+#### Zbiór testowy
+
+```{r mlp_testing}
+mlp_predicted <- predict(mlp_model, testing)
+postResample(pred = mlp_predicted, obs = testing$length)
+```
+
+### Porównanie
+
+```{r regression_summary}
+resamps <- resamples(list(linear_regression=lm_model,
+                          random_forest=rf_model,
+                          multi_layer_perceptron=mlp_model))
+
+summary(resamps)
+```
+
+Powyżej widzimy porównanie trzech utworzonych regreserów. Najlepszy wynik został osiągnięty przez **random forest** - ma on najmniejszą wartość *RMSE* oraz największą wartość *R-squared*.
+
+## Analiza ważności atrybutów modelu regresji
+
+```{r attr_analysis}
+varImp(rf_model)
+```
+
+Atrybut, od którego długość śledzia jest najbardziej zależna w naszym regresorze, to *sst* - czyli temperatura przy powierzchni wody. Ponieważ są skorelowane ujemne, to oznacza to, że wzrost temperatury wpływa na zmniejszanie się długości śledzia. Możemy przypuszczać, że globalne ocieplenie wpływa na podwyższenie temperatury wód, a co za tym idzie, ma wpływ na karłowacenie śledzi.
+
+Drugim według ważności atrybutem jest *fbar*, czyli natężenie połowów w regionie. Są skorelowanie dodatnie, więc niestety działalność człowieka i wzmożone połowy tego gatunku wpływają negatywnie na ich rozmiar.
+
+Trzeci atrybut pod względem ważności to jest *lcop1*, czyli dostępność jednego z rodzajów planktonu. Również są skorelowane dodatnie, więc ograniczona dostępność do tego rodzaju pożywienia również negatywnie wpływa na rozmiar śledzi. Ograniczenie dostępności tego rodzaju planktonu również może wynikać z globalnego ocieplenia lub przez działalność człowieka, przez to może mieć mniej korzystne warunki do rozwijania.
+
+W naszym regresorze atrybut *nao* (oscylacja północnoatlantycka) ma niewielki wpływ, a *chel1* (dostępność określonego gatunku planktonu) zerowy.
+
+## Istniejące wyniki badań w literaturze naukowej
+
+Nasze wnioski pokrywają się z literaturą naukową i dotychczasowymi wynikami badań na dany temat. Przykładowo @tanasichuk1997influence w swojej pracy opisuje wpływ klimatu oceanicznego na wzrost śledzia pacyficznego i jego wnioski są podobne. Również pisze, że to wzrost temperatury oceanów wpływa na zmniejszającą się długość śledzi.
